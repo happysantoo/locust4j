@@ -512,9 +512,13 @@ public class Runner {
             while (true) {
                 try {
                     Message message = runner.rpcClient.recv();
-                    if (message != null) {  // null means timeout, just continue
+                    if (message != null) {
+                        // Process valid message
                         runner.onMessage(message);
                     }
+                    // If null (timeout after 300ms), just continue to next iteration
+                    // This allows the socket lock to be released frequently for the Sender thread,
+                    // which is critical for sending heartbeats reliably (1000ms interval)
                 } catch (IOException ex) {
                     logger.error("Failed to receive message from master, quit", ex);
                     break;

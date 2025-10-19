@@ -36,10 +36,17 @@ public class ZeromqClient implements Client {
         this.identity = nodeID;
         this.dealerSocket = context.socket(ZMQ.DEALER);
         this.dealerSocket.setIdentity(this.identity.getBytes());
-        // Set socket to non-blocking mode with a short timeout (100ms)
-        // This allows the lock to be released frequently for heartbeats and other messages
-        // while still preventing indefinite blocking that could cause deadlocks
-        this.dealerSocket.setReceiveTimeOut(100);
+        // Set socket receive timeout to 300ms
+        // This balances:
+        // 1. Responsiveness: Lock released every 300ms for Sender thread (critical for heartbeats)
+        // 2. Stability: Long enough for legitimate messages to arrive
+        // 3. Deadlock prevention: Prevents indefinite blocking on recv()
+        // 
+        // With 1000ms heartbeat interval and 300ms lock timeout:
+        // - Heartbeater queues message at T=1000ms
+        // - Sender acquires lock within ~300ms and sends before next heartbeat
+        // - No race condition or missed heartbeats
+        this.dealerSocket.setReceiveTimeOut(300);
         boolean connected = this.dealerSocket.connect(String.format("tcp://%s:%d", host, port));
         if (connected) {
             logger.debug("Locust4j is connected to master({}:{})", host, port);
