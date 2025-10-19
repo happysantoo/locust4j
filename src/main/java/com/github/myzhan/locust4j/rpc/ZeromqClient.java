@@ -36,9 +36,10 @@ public class ZeromqClient implements Client {
         this.identity = nodeID;
         this.dealerSocket = context.socket(ZMQ.DEALER);
         this.dealerSocket.setIdentity(this.identity.getBytes());
-        // Set socket to non-blocking mode with timeout (1000ms)
-        // This prevents indefinite blocking that could cause deadlocks
-        this.dealerSocket.setReceiveTimeOut(1000);
+        // Set socket to non-blocking mode with a short timeout (100ms)
+        // This allows the lock to be released frequently for heartbeats and other messages
+        // while still preventing indefinite blocking that could cause deadlocks
+        this.dealerSocket.setReceiveTimeOut(100);
         boolean connected = this.dealerSocket.connect(String.format("tcp://%s:%d", host, port));
         if (connected) {
             logger.debug("Locust4j is connected to master({}:{})", host, port);
