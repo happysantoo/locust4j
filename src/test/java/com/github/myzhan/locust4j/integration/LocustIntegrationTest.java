@@ -263,14 +263,16 @@ public class LocustIntegrationTest {
             "        pass\n";
         Files.write(locustfile, locustfileContent.getBytes());
         
-        // Start Locust master
+        // Start Locust master with auto-spawn
         ProcessBuilder pb = new ProcessBuilder(
             pythonExecutable, "-m", "locust",
             "--master",
             "--master-bind-port", String.valueOf(TEST_PORT),
             "--expect-workers", "1",
             "-f", locustfile.toString(),
-            "--headless"
+            "--headless",
+            "--users", "5",
+            "--spawn-rate", "5"
         );
         
         pb.redirectErrorStream(true);
@@ -327,8 +329,9 @@ public class LocustIntegrationTest {
 
         logger.info("Running end-to-end integration test...");
         
-        // Create test tasks
-        CountDownLatch executionLatch = new CountDownLatch(10);
+        // Create test tasks - increase latch count to ensure both tasks execute
+        // With weight 2:1, we need enough executions for statistical distribution
+        CountDownLatch executionLatch = new CountDownLatch(30);
         SimpleTestTask task1 = new SimpleTestTask("integration_test_task_1", 2, executionLatch);
         SimpleTestTask task2 = new SimpleTestTask("integration_test_task_2", 1, executionLatch);
         

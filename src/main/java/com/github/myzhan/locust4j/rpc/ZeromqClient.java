@@ -23,6 +23,14 @@ public class ZeromqClient implements Client {
     private final ZMQ.Context context = ZMQ.context(1);
     private final String identity;
     private final ZMQ.Socket dealerSocket;
+    /**
+     * Lock for thread-safe access to the ZMQ socket.
+     * ZMQ sockets are NOT thread-safe, so all recv() and send() operations
+     * must be synchronized. This is especially important when virtual threads
+     * are enabled, as many virtual threads may be trying to receive/send
+     * messages concurrently through the same socket.
+     */
+    private final Object socketLock = new Object();
 
     public ZeromqClient(String host, int port, String nodeID) {
         this.identity = nodeID;
@@ -39,24 +47,34 @@ public class ZeromqClient implements Client {
 
     @Override
     public Message recv() throws IOException {
-        try {
-            byte[] bytes = this.dealerSocket.recv();
-            return new Message(bytes);
-        } catch (ZMQException ex) {
-            throw new IOException("Failed to receive ZeroMQ message", ex);
+        synchronized (socketLock) {
+            try {
+                byte[] bytes = this.dealerSocket.recv();
+                return new Message(bytes);
+            } catch (ZMQException ex) {
+                throw new IOException("Failed to receive ZeroMQ message", ex);
+            }
         }
     }
 
     @Override
     public void send(Message message) throws IOException {
-        byte[] bytes = message.getBytes();
-        this.dealerSocket.send(bytes);
+        synchronized (socketLock) {
+            try {
+                byte[] bytes = message.getBytes();
+                this.dealerSocket.send(bytes);
+            } catch (ZMQException ex) {
+                throw new IOException("Failed to send ZeroMQ message", ex);
+            }
+        }
     }
 
     @Override
     public void close() {
-        dealerSocket.close();
-        context.close();
+        synchronized (socketLock) {
+            dealerSocket.close();
+            context.close();
+        }
     }
 }
 
