@@ -512,7 +512,9 @@ public class Runner {
             while (true) {
                 try {
                     Message message = runner.rpcClient.recv();
-                    runner.onMessage(message);
+                    if (message != null) {  // null means timeout, just continue
+                        runner.onMessage(message);
+                    }
                 } catch (IOException ex) {
                     logger.error("Failed to receive message from master, quit", ex);
                     break;
