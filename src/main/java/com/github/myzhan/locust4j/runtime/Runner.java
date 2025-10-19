@@ -511,16 +511,20 @@ public class Runner {
             Thread.currentThread().setName(name + "receive-from-client");
             while (true) {
                 try {
+                    // Non-blocking receive - returns null if no message available
                     Message message = runner.rpcClient.recv();
                     if (message != null) {
-                        // Process valid message
                         runner.onMessage(message);
+                    } else {
+                        // No message available - sleep briefly to avoid busy-waiting
+                        // This gives other threads (especially Sender) a chance to run
+                        Thread.sleep(10);
                     }
-                    // If null (timeout after 300ms), just continue to next iteration
-                    // This allows the socket lock to be released frequently for the Sender thread,
-                    // which is critical for sending heartbeats reliably (1000ms interval)
                 } catch (IOException ex) {
                     logger.error("Failed to receive message from master, quit", ex);
+                    break;
+                } catch (InterruptedException ex) {
+                    // Thread interrupted, exit gracefully
                     break;
                 } catch (Exception ex) {
                     logger.error("Error while receiving a message", ex);
@@ -542,18 +546,38 @@ public class Runner {
             Thread.currentThread().setName(name + "send-to-client");
             while (true) {
                 try {
-                    Map<String, Object> data = runner.stats.getMessageToRunnerQueue().take();
-                    if (data.containsKey("current_cpu_usage")) {
-                        // It's heartbeat message, moved to here to avoid race condition of zmq socket.
-                        runner.rpcClient.send(new Message("heartbeat", data, -1, runner.nodeID));
+                    // Get message from queue with short timeout to allow periodic sends
+                    Map<String, Object> data = runner.stats.getMessageToRunnerQueue().poll(100, TimeUnit.MILLISECONDS);
+                    if (data == null) {
+                        // No message in queue, continue (allows checking for shutdown, etc.)
                         continue;
                     }
+                    
+                    if (data.containsKey("current_cpu_usage")) {
+                        // It's heartbeat message
+                        try {
+                            runner.rpcClient.send(new Message("heartbeat", data, -1, runner.nodeID));
+                        } catch (IOException ex) {
+                            // Send failed (possibly buffer full), put message back in queue
+                            // Use offer() to avoid blocking - if queue is full, drop the old heartbeat
+                            runner.stats.getMessageToRunnerQueue().offer(data);
+                            logger.debug("Heartbeat send failed, will retry: {}", ex.getMessage());
+                        }
+                        continue;
+                    }
+                    
                     if (runner.state == RunnerState.Ready || runner.state == RunnerState.Stopped) {
                         continue;
                     }
+                    
                     data.put("user_count", runner.numClients);
                     data.put("user_classes_count", runner.userClassesCountFromMaster);
-                    runner.rpcClient.send(new Message("stats", data, -1, runner.nodeID));
+                    try {
+                        runner.rpcClient.send(new Message("stats", data, -1, runner.nodeID));
+                    } catch (IOException ex) {
+                        // Send failed - log but don't block
+                        logger.debug("Stats send failed, message dropped: {}", ex.getMessage());
+                    }
                 } catch (InterruptedException ex) {
                     return;
                 } catch (Exception ex) {
