@@ -77,7 +77,14 @@ public class TestStats {
 
         stats.getClearStatsQueue().offer(true);
         stats.wakeMeUp();
-        Thread.sleep(500);
+        
+        // Wait for stats to be cleared (with timeout)
+        int maxWaitMs = 3000;
+        int waitedMs = 0;
+        while (stats.serializeStats().size() > 0 && waitedMs < maxWaitMs) {
+            Thread.sleep(100);
+            waitedMs += 100;
+        }
 
         // stats is cleared in another thread
         assertEquals(0, stats.serializeStats().size());

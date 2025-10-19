@@ -167,23 +167,39 @@ Thread virtualThread = Thread.ofVirtual()
 ```
 
 #### Runner Class
-- Fixed executor type to `ExecutorService` (was incorrectly casting to `ThreadPoolExecutor`)
-- Simplified `getReady()` method to use `VirtualThreads.createExecutorService()` directly
+- **Critical Fix**: Always use platform threads for ZeroMQ RPC communication
+- Prevents thread pinning caused by ZeroMQ's native blocking `recv()` calls
+- Task executor still uses virtual threads for maximum scalability
 
-**Before:**
-```java
-if (VirtualThreads.isEnabled()) {
-    this.executor = (ThreadPoolExecutor) VirtualThreads.createExecutorService("locust4j-rpc-");
-} else {
-    this.executor = new ThreadPoolExecutor(4, 4, ...);
-}
-```
+**Architecture Decision - Mixed Threading Model:**
 
-**After:**
+The Runner now uses an intelligent hybrid approach:
+- **RPC Communication**: Platform threads (4 fixed threads) - avoids ZeroMQ pinning
+- **Task Execution**: Virtual threads (when enabled) - scales to 1M+ users
+- **Stats Processing**: Virtual threads (when enabled) - high throughput
+
+**Before (v3.0.0-beta - had pinning issues):**
 ```java
+// This caused ZeroMQ thread pinning!
 this.executor = VirtualThreads.createExecutorService("locust4j-rpc-");
-// Handles both virtual and platform threads internally
 ```
+
+**After (v3.0.0-final - fixed):**
+```java
+// Always use platform threads for RPC to avoid ZeroMQ native call pinning
+AtomicInteger rpcThreadCounter = new AtomicInteger(0);
+this.executor = Executors.newFixedThreadPool(4, r -> {
+    Thread thread = new Thread(r);
+    thread.setName("locust4j-rpc-platform-" + rpcThreadCounter.incrementAndGet());
+    return thread;
+});
+```
+
+**Why This Matters:**
+- ZeroMQ uses JNI native calls for `recv()` which pin virtual threads
+- Pinning defeats the scalability benefits of virtual threads
+- 4 platform threads handle all RPC needs efficiently
+- Virtual threads remain free to scale worker tasks to 1M+
 
 ## Performance Comparison
 

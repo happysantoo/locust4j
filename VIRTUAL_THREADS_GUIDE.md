@@ -330,11 +330,29 @@ Locust4j implements virtual threads using:
 
 ### Thread Pinning Prevention
 
-Virtual threads can be "pinned" to carrier threads by synchronized blocks, reducing performance. Locust4j prevents this by:
+Virtual threads can be "pinned" to carrier threads by synchronized blocks and native calls, reducing performance. Locust4j prevents this by:
 
 - Replacing all `synchronized` blocks with `ReentrantLock`
 - Using `Condition` instead of `wait()`/`notify()`
 - Properly releasing locks in `finally` blocks
+- **Using platform threads for ZeroMQ RPC communication** (native blocking calls)
+
+### Architecture Decision: Mixed Threading Model
+
+Locust4j uses an intelligent mixed threading model:
+
+**Virtual Threads** (when enabled):
+- Worker task execution pool (massive scalability)
+- Stats processing (high throughput)
+
+**Platform Threads** (always):
+- ZeroMQ RPC communication (4 dedicated threads)
+- Reason: ZeroMQ's native `recv()` calls cause thread pinning
+
+This hybrid approach gives you the best of both worlds:
+- 1M+ concurrent user tasks (virtual threads)
+- Stable, efficient RPC communication (platform threads)
+- No performance degradation from pinning
 
 ## FAQs
 

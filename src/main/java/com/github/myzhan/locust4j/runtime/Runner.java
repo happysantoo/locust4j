@@ -455,14 +455,15 @@ public class Runner {
     public void getReady() {
         logger.info("Runner initializing with: {}", VirtualThreads.getThreadingMode());
         
-        // Use VirtualThreads utility which handles both virtual and platform threads
-        this.executor = VirtualThreads.createExecutorService("locust4j-rpc-");
-        
-        if (VirtualThreads.isEnabled()) {
-            logger.info("Virtual thread executor created for RPC communication threads");
-        } else {
-            logger.info("Platform thread pool created for RPC communication");
-        }
+        // Always use platform threads for RPC communication to avoid ZeroMQ thread pinning issues
+        // ZeroMQ's native blocking calls pin virtual threads to carrier threads
+        AtomicInteger rpcThreadCounter = new AtomicInteger(0);
+        this.executor = Executors.newFixedThreadPool(4, r -> {
+            Thread thread = new Thread(r);
+            thread.setName("locust4j-rpc-platform-" + rpcThreadCounter.incrementAndGet());
+            return thread;
+        });
+        logger.info("Platform thread pool created for RPC communication (avoids ZeroMQ pinning)");
         
         this.state = RunnerState.Ready;
         try {
