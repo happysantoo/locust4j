@@ -6,6 +6,10 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+import com.github.myzhan.locust4j.utils.VirtualThreads;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,7 +37,8 @@ public class RampUpRateLimiter extends AbstractRateLimiter {
 
     private ScheduledExecutorService bucketUpdater;
     private ScheduledExecutorService thresholdUpdater;
-    private final Object lock = new Object();
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition condition = lock.newCondition();
     private final AtomicBoolean stopped;
 
     /**
@@ -61,14 +66,38 @@ public class RampUpRateLimiter extends AbstractRateLimiter {
 
     @Override
     public void start() {
-        thresholdUpdater = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-                Thread thread = new Thread(r);
-                thread.setName("StableRateLimiter-threshold-updater");
-                return thread;
-            }
-        });
+        logger.debug("Starting RampUpRateLimiter with max threshold: {}, ramp-up step: {} per {} {}", 
+                maxThreshold, rampUpStep, rampUpPeriod, rampUpTimeUnit);
+        
+        ThreadFactory thresholdFactory;
+        ThreadFactory bucketFactory;
+        
+        if (VirtualThreads.isEnabled()) {
+            thresholdFactory = VirtualThreads.createThreadFactory("RampUpRateLimiter-threshold-updater-", 
+                    new AtomicLong(0));
+            bucketFactory = VirtualThreads.createThreadFactory("RampUpRateLimiter-bucket-updater-", 
+                    new AtomicLong(0));
+            logger.debug("Using virtual threads for ramp-up rate limiter");
+        } else {
+            thresholdFactory = new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread thread = new Thread(r);
+                    thread.setName("RampUpRateLimiter-threshold-updater");
+                    return thread;
+                }
+            };
+            bucketFactory = new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread thread = new Thread(r);
+                    thread.setName("RampUpRateLimiter-bucket-updater");
+                    return thread;
+                }
+            };
+        }
+        
+        thresholdUpdater = new ScheduledThreadPoolExecutor(1, thresholdFactory);
         thresholdUpdater.scheduleAtFixedRate(new Runnable() {
             @Override
             public void run() {
@@ -84,37 +113,36 @@ public class RampUpRateLimiter extends AbstractRateLimiter {
             }
         }, 0, rampUpPeriod, rampUpTimeUnit);
 
-        bucketUpdater = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-                Thread thread = new Thread(r);
-                thread.setName("StableRateLimiter-bucket-updater");
-                return thread;
-            }
-        });
+        bucketUpdater = new ScheduledThreadPoolExecutor(1, bucketFactory);
         bucketUpdater.scheduleAtFixedRate(new Runnable() {
             @Override
             public void run() {
-                synchronized (lock) {
+                lock.lock();
+                try {
                     threshold.set(nextThreshold.get());
-                    lock.notifyAll();
+                    condition.signalAll();
+                } finally {
+                    lock.unlock();
                 }
             }
         }, 0, refillPeriod, refillUnit);
 
         stopped.set(false);
+        logger.debug("RampUpRateLimiter started successfully");
     }
 
     @Override
     public boolean acquire() {
         long permit = this.threshold.decrementAndGet();
         if (permit < 0) {
-            synchronized (lock) {
-                try {
-                    lock.wait();
-                } catch (InterruptedException ex) {
-                    logger.error("The process of acquiring a permit from rate limiter was interrupted", ex);
-                }
+            lock.lock();
+            try {
+                condition.await();
+            } catch (InterruptedException ex) {
+                logger.error("The process of acquiring a permit from rate limiter was interrupted", ex);
+                Thread.currentThread().interrupt(); // Restore interrupted status
+            } finally {
+                lock.unlock();
             }
             return true;
         }

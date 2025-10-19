@@ -2,7 +2,6 @@ package com.github.myzhan.locust4j.utils;
 
 import java.io.IOException;
 
-import org.junit.Ignore;
 import org.junit.Test;
 
 import static org.junit.Assert.*;
@@ -15,16 +14,29 @@ public class TestUtils {
     }
 
     @Test
-    @Ignore
     public void TestGetHostname() throws IOException {
-        Process proc = Runtime.getRuntime().exec("hostname");
-        java.io.InputStream is = proc.getInputStream();
-        java.util.Scanner s = new java.util.Scanner(is).useDelimiter(System.lineSeparator());
-        String hostname = "";
-        if (s.hasNext()) {
-            hostname = s.next();
+        // Test that getHostname returns a non-null, non-empty string
+        String hostname = Utils.getHostname();
+        assertNotNull("Hostname should not be null", hostname);
+        assertFalse("Hostname should not be empty", hostname.isEmpty());
+        
+        // If we can get system hostname, verify they match
+        // Otherwise, we should at least get "unknown" as fallback
+        try {
+            Process proc = Runtime.getRuntime().exec("hostname");
+            java.io.InputStream is = proc.getInputStream();
+            java.util.Scanner s = new java.util.Scanner(is).useDelimiter(System.lineSeparator());
+            if (s.hasNext()) {
+                String systemHostname = s.next().trim();
+                assertEquals("Hostname should match system hostname", systemHostname, hostname);
+            }
+            s.close();
+            is.close();
+        } catch (IOException e) {
+            // If we can't get system hostname, just verify we got something
+            assertTrue("Should return hostname or 'unknown'", 
+                hostname.equals("unknown") || hostname.length() > 0);
         }
-        assertEquals(hostname, Utils.getHostname());
     }
 
     @Test

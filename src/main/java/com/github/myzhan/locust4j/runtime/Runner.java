@@ -7,6 +7,7 @@ import com.github.myzhan.locust4j.message.Message;
 import com.github.myzhan.locust4j.rpc.Client;
 import com.github.myzhan.locust4j.stats.Stats;
 import com.github.myzhan.locust4j.utils.Utils;
+import com.github.myzhan.locust4j.utils.VirtualThreads;
 import com.sun.management.OperatingSystemMXBean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -143,6 +144,44 @@ public class Runner {
         this.taskExecutor = taskExecutor;
     }
 
+    /**
+     * Create a virtual thread executor for worker tasks.
+     * Uses reflection to ensure compatibility across Java versions.
+     *
+     * @param spawnCount initial number of workers
+     * @return ThreadPoolExecutor configured for virtual threads or platform threads
+     */
+    private ThreadPoolExecutor createVirtualThreadExecutor(int spawnCount) {
+        try {
+            AtomicInteger counter = new AtomicInteger();
+            ThreadFactory factory = VirtualThreads.createThreadFactory("locust4j-worker#", 
+                    new AtomicLong(counter.get()));
+            
+            // For virtual threads, we use a flexible executor that creates threads on demand
+            ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                    spawnCount, 
+                    Integer.MAX_VALUE,  // Allow unlimited threads for virtual threads
+                    60L, TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<Runnable>(),
+                    factory);
+            
+            executor.allowCoreThreadTimeOut(true);
+            return executor;
+        } catch (Exception e) {
+            logger.error("Failed to create virtual thread executor, falling back to platform threads", e);
+            return new ThreadPoolExecutor(spawnCount, spawnCount, 0L, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<Runnable>(),
+                    new ThreadFactory() {
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread thread = new Thread(r);
+                            thread.setName("locust4j-worker#" + threadNumber.getAndIncrement());
+                            return thread;
+                        }
+                    });
+        }
+    }
+
     private void spawnWorkers(int spawnCount) {
         logger.debug("Required {} clients. Currently running {}.", spawnCount, this.taskExecutor.getActiveCount());
 
@@ -204,22 +243,39 @@ public class Runner {
             return;
         }
         if (this.taskExecutor == null) {
-            this.setTaskExecutor(new ThreadPoolExecutor(spawnCount, spawnCount, 0L, TimeUnit.MILLISECONDS,
-                    new LinkedBlockingQueue<Runnable>(),
-                    new ThreadFactory() {
-                        @Override
-                        public Thread newThread(Runnable r) {
-                            Thread thread = new Thread(r);
-                            thread.setName("locust4j-worker#" + threadNumber.getAndIncrement());
-                            return thread;
-                        }
-                    }));
+            logger.info("Creating worker thread pool for {} workers using: {}", 
+                    spawnCount, VirtualThreads.getThreadingMode());
+            
+            if (VirtualThreads.isEnabled()) {
+                // Use virtual threads for maximum scalability
+                this.setTaskExecutor(createVirtualThreadExecutor(spawnCount));
+                logger.info("Virtual thread executor created for {} workers. Memory-efficient mode enabled.", spawnCount);
+            } else {
+                // Fallback to platform threads
+                this.setTaskExecutor(new ThreadPoolExecutor(spawnCount, spawnCount, 0L, TimeUnit.MILLISECONDS,
+                        new LinkedBlockingQueue<Runnable>(),
+                        new ThreadFactory() {
+                            @Override
+                            public Thread newThread(Runnable r) {
+                                Thread thread = new Thread(r);
+                                thread.setName("locust4j-worker#" + threadNumber.getAndIncrement());
+                                return thread;
+                            }
+                        }));
+                logger.info("Platform thread pool created for {} workers.", spawnCount);
+            }
         } else if (spawnCount > this.taskExecutor.getMaximumPoolSize()) {
+            logger.info("Scaling up worker pool from {} to {} workers", 
+                    this.taskExecutor.getMaximumPoolSize(), spawnCount);
             this.taskExecutor.setMaximumPoolSize(spawnCount);
             this.taskExecutor.setCorePoolSize(spawnCount);
+            VirtualThreads.logThreadStats("Worker Pool", spawnCount);
         } else {
+            logger.info("Scaling down worker pool from {} to {} workers", 
+                    this.taskExecutor.getMaximumPoolSize(), spawnCount);
             this.taskExecutor.setCorePoolSize(spawnCount);
             this.taskExecutor.setMaximumPoolSize(spawnCount);
+            VirtualThreads.logThreadStats("Worker Pool", spawnCount);
         }
 
         this.spawnWorkers(spawnCount);
@@ -397,33 +453,48 @@ public class Runner {
     }
 
     public void getReady() {
-        this.executor = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
-                new LinkedBlockingQueue<Runnable>(), new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-                return new Thread(r);
-            }
-        });
+        logger.info("Runner initializing with: {}", VirtualThreads.getThreadingMode());
+        
+        // Use VirtualThreads utility which handles both virtual and platform threads
+        this.executor = VirtualThreads.createExecutorService("locust4j-rpc-");
+        
+        if (VirtualThreads.isEnabled()) {
+            logger.info("Virtual thread executor created for RPC communication threads");
+        } else {
+            logger.info("Platform thread pool created for RPC communication");
+        }
+        
         this.state = RunnerState.Ready;
         try {
             this.rpcClient.send(new Message("client_ready", null, -1, this.nodeID));
+            logger.debug("Sent client_ready message to master");
         } catch (IOException ex) {
             logger.error("Error while sending a message that the system is ready", ex);
         }
 
         this.executor.submit(new Receiver(this));
         this.executor.submit(new Sender(this));
+        logger.debug("Started Receiver and Sender threads");
 
         // Wait for the ack message from master.
         try {
-            this.waitForAck.await(Runner.CONNECT_TIMEOUT, TimeUnit.SECONDS);
+            boolean ackReceived = this.waitForAck.await(Runner.CONNECT_TIMEOUT, TimeUnit.SECONDS);
+            if (ackReceived) {
+                logger.info("Successfully connected to master and received acknowledgment");
+            } else {
+                logger.warn("Timeout waiting for ack message from master after {} seconds. " +
+                        "You may use a locust version before 2.10.0 or have a network issue", 
+                        Runner.CONNECT_TIMEOUT);
+            }
         } catch (InterruptedException ex) {
-            logger.info("Timeout waiting for ack message from master, you may use a locust version before 2.10.0 or have" +
-                    "a network issue");
+            logger.warn("Interrupted while waiting for ack message from master", ex);
         }
 
         this.executor.submit(new Heartbeater(this));
         this.executor.submit(new HeartbeatListener(this));
+        logger.debug("Started Heartbeater and HeartbeatListener threads");
+        
+        VirtualThreads.logThreadStats("RPC Communication", 4);
     }
 
     private static class Receiver implements Runnable {

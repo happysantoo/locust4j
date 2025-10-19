@@ -14,8 +14,11 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 import com.github.myzhan.locust4j.utils.Utils;
+import com.github.myzhan.locust4j.utils.VirtualThreads;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,7 +43,8 @@ public class Stats implements Runnable {
 
     private ExecutorService threadPool;
     private final AtomicInteger threadNumber;
-    private final Object lock = new Object();
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition condition = lock.newCondition();
 
     /**
      * Probably, you don't need to create Stats unless you are writing unit tests.
@@ -64,18 +68,29 @@ public class Stats implements Runnable {
     }
 
     public void start() {
-        threadPool = new ThreadPoolExecutor(2, Integer.MAX_VALUE, 0L, TimeUnit.MILLISECONDS,
-            new LinkedBlockingQueue<Runnable>(), new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-                Thread thread = new Thread(r);
-                thread.setName(String.format("locust4j-stats#%d#", threadNumber.getAndIncrement()));
-                return thread;
-            }
-        });
+        logger.info("Starting Stats collection with: {}", VirtualThreads.getThreadingMode());
+        
+        if (VirtualThreads.isEnabled()) {
+            // Use virtual threads for stats processing - can handle much higher throughput
+            threadPool = VirtualThreads.createExecutorService("locust4j-stats#");
+            logger.info("Virtual thread executor created for stats processing (unlimited capacity)");
+        } else {
+            // Fallback to platform threads
+            threadPool = new ThreadPoolExecutor(2, Integer.MAX_VALUE, 0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<Runnable>(), new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread thread = new Thread(r);
+                    thread.setName(String.format("locust4j-stats#%d#", threadNumber.getAndIncrement()));
+                    return thread;
+                }
+            });
+            logger.info("Platform thread pool created for stats processing (initial: 2 threads)");
+        }
 
         threadPool.submit(new StatsTimer(this));
         threadPool.submit(this);
+        logger.debug("Started StatsTimer and Stats processing threads");
     }
 
     public void stop() {
@@ -99,18 +114,28 @@ public class Stats implements Runnable {
     }
 
     public void wakeMeUp() {
-        synchronized (lock) {
-            lock.notifyAll();
+        lock.lock();
+        try {
+            condition.signalAll();
+            if (VirtualThreads.isVerbose()) {
+                logger.trace("Stats thread woken up for processing");
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
     private void sleep() {
-        synchronized (lock) {
-            try {
-                lock.wait();
-            } catch (Exception ex) {
-                logger.error(ex.getMessage());
-            }
+        lock.lock();
+        try {
+            condition.await();
+        } catch (InterruptedException ex) {
+            logger.debug("Stats thread interrupted while sleeping", ex);
+            Thread.currentThread().interrupt(); // Restore interrupted status
+        } catch (Exception ex) {
+            logger.error("Error while Stats thread was waiting", ex);
+        } finally {
+            lock.unlock();
         }
     }
 

@@ -12,6 +12,7 @@ import com.github.myzhan.locust4j.AbstractTask;
 import com.github.myzhan.locust4j.LocustTestHelper;
 import com.github.myzhan.locust4j.message.Message;
 import com.github.myzhan.locust4j.stats.Stats;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -35,15 +36,31 @@ public class TestRunner {
     private Runner runner;
 
     private MockRPCClient client;
+    
+    private String originalVirtualThreadsProperty;
 
     @Before
     public void before() {
+        // Save and disable virtual threads for these tests since they cast to ThreadPoolExecutor
+        originalVirtualThreadsProperty = System.getProperty("locust4j.virtualThreads.enabled");
+        System.setProperty("locust4j.virtualThreads.enabled", "false");
+        
         runner = new Runner();
         runner.setStats(new Stats());
         runner.setTasks(Collections.singletonList((AbstractTask) new TestTask()));
         client = new MockRPCClient();
         runner.setRPCClient(client);
         LocustTestHelper.setLocustRunner(runner);
+    }
+    
+    @After
+    public void after() {
+        // Restore original virtual threads property
+        if (originalVirtualThreadsProperty != null) {
+            System.setProperty("locust4j.virtualThreads.enabled", originalVirtualThreadsProperty);
+        } else {
+            System.clearProperty("locust4j.virtualThreads.enabled");
+        }
     }
 
     private static class TestTask extends AbstractTask {
