@@ -511,20 +511,16 @@ public class Runner {
             Thread.currentThread().setName(name + "receive-from-client");
             while (true) {
                 try {
-                    // Non-blocking receive - returns null if no message available
+                    // Blocking receive with 300ms timeout
+                    // Timeout ensures lock is released periodically for Sender thread
                     Message message = runner.rpcClient.recv();
                     if (message != null) {
                         runner.onMessage(message);
-                    } else {
-                        // No message available - sleep briefly to avoid busy-waiting
-                        // This gives other threads (especially Sender) a chance to run
-                        Thread.sleep(10);
                     }
+                    // If null (timeout), loop continues and tries recv() again
+                    // This gives Sender thread fair chance to acquire lock
                 } catch (IOException ex) {
                     logger.error("Failed to receive message from master, quit", ex);
-                    break;
-                } catch (InterruptedException ex) {
-                    // Thread interrupted, exit gracefully
                     break;
                 } catch (Exception ex) {
                     logger.error("Error while receiving a message", ex);
@@ -535,8 +531,6 @@ public class Runner {
 
     private static class Sender implements Runnable {
         private final Runner runner;
-        private static final int MAX_RETRIES = 5;
-        private static final int RETRY_DELAY_MS = 10;
 
         private Sender(Runner runner) {
             this.runner = runner;
@@ -548,16 +542,14 @@ public class Runner {
             Thread.currentThread().setName(name + "send-to-client");
             while (true) {
                 try {
-                    // Get message from queue with short timeout to allow periodic sends
-                    Map<String, Object> data = runner.stats.getMessageToRunnerQueue().poll(100, TimeUnit.MILLISECONDS);
-                    if (data == null) {
-                        // No message in queue, continue (allows checking for shutdown, etc.)
-                        continue;
-                    }
+                    // Blocking wait for message from stats queue
+                    // With recv() timeout, this will never deadlock:
+                    // Receiver releases lock every 300ms, allowing us to send
+                    Map<String, Object> data = runner.stats.getMessageToRunnerQueue().take();
                     
                     if (data.containsKey("current_cpu_usage")) {
-                        // It's heartbeat message - MUST be sent
-                        sendWithRetry("heartbeat", data, true);
+                        // It's heartbeat message
+                        runner.rpcClient.send(new Message("heartbeat", data, -1, runner.nodeID));
                         continue;
                     }
                     
@@ -567,68 +559,16 @@ public class Runner {
                     
                     data.put("user_count", runner.numClients);
                     data.put("user_classes_count", runner.userClassesCountFromMaster);
-                    sendWithRetry("stats", data, false);
+                    runner.rpcClient.send(new Message("stats", data, -1, runner.nodeID));
                     
                 } catch (InterruptedException ex) {
                     return;
+                } catch (IOException ex) {
+                    // Send failed - log and continue (receiver will retry or drop message)
+                    logger.error("Error sending message to master: {}", ex.getMessage());
                 } catch (Exception ex) {
                     logger.error("Error in running the sender", ex);
                 }
-            }
-        }
-        
-        /**
-         * Send a message with retry logic.
-         * @param messageType Type of message for logging
-         * @param data Message data
-         * @param isCritical If true, log failures at ERROR level, else DEBUG
-         */
-        private void sendWithRetry(String messageType, Map<String, Object> data, boolean isCritical) {
-            IOException lastException = null;
-            
-            for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-                try {
-                    runner.rpcClient.send(new Message(messageType, data, -1, runner.nodeID));
-                    
-                    // Success - no need to retry
-                    if (VirtualThreads.isVerbose() && attempt > 0) {
-                        logger.debug("{} message sent successfully after {} attempts", messageType, attempt + 1);
-                    }
-                    return;
-                    
-                } catch (IOException ex) {
-                    lastException = ex;
-                    
-                    // Check if this is a retriable error (EAGAIN - buffer full)
-                    if (ex.getMessage() != null && ex.getMessage().contains("retry later")) {
-                        // Buffer is full, wait a bit and retry
-                        if (attempt < MAX_RETRIES - 1) {
-                            try {
-                                Thread.sleep(RETRY_DELAY_MS * (attempt + 1));  // Exponential backoff
-                            } catch (InterruptedException ie) {
-                                Thread.currentThread().interrupt();
-                                // Exit the retry loop on interrupt
-                                break;
-                            }
-                            if (VirtualThreads.isVerbose()) {
-                                logger.trace("{} send failed (attempt {}), retrying...", messageType, attempt + 1);
-                            }
-                            continue;
-                        }
-                    } else {
-                        // Non-retriable error
-                        break;
-                    }
-                }
-            }
-            
-            // All retries exhausted
-            if (isCritical) {
-                logger.error("Failed to send {} message after {} attempts: {}", 
-                    messageType, MAX_RETRIES, lastException != null ? lastException.getMessage() : "unknown error");
-            } else {
-                logger.debug("Failed to send {} message after {} attempts: {}", 
-                    messageType, MAX_RETRIES, lastException != null ? lastException.getMessage() : "unknown error");
             }
         }
     }

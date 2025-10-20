@@ -35,16 +35,8 @@ public class TestZeromqClient {
 
             client.send(new Message("test", data, -1, "node"));
             
-            // With non-blocking recv, we need to retry with a timeout
-            Message message = null;
-            long timeout = System.currentTimeMillis() + 5000;  // 5 second timeout
-            while (System.currentTimeMillis() < timeout) {
-                message = client.recv();
-                if (message != null) {
-                    break;
-                }
-                Thread.sleep(50);  // Small sleep before retry
-            }
+            // With blocking recv() and 300ms timeout, message should arrive quickly
+            Message message = client.recv();
 
             assertNotNull("Received message should not be null", message);
             assertEquals("Message type should match", "test", message.getType());

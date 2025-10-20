@@ -14,8 +14,15 @@ import org.zeromq.ZMQException;
  *
  * Locust4j only supports zeromq.
  *
- * This implementation uses non-blocking I/O with ZMQ polling to avoid
- * the deadlock issue where recv() with a lock would block send() operations.
+ * This implementation uses blocking I/O with timeout on recv() to ensure:
+ * 1. Thread safety: All operations guarded by socketLock mutex
+ * 2. Deadlock prevention: recv() timeout guarantees lock is released periodically
+ * 3. Simplicity: No complex error handling for EAGAIN or buffer management
+ *
+ * Architecture:
+ * - Receiver thread: Holds lock during recv(300ms), releases every 300ms
+ * - Sender thread: Can acquire lock when Receiver releases it (max 300ms wait)
+ * - Result: Heartbeats sent reliably, no starvation
  *
  * @author myzhan
  */
@@ -26,11 +33,19 @@ public class ZeromqClient implements Client {
     private final ZMQ.Context context = ZMQ.context(1);
     private final String identity;
     private final ZMQ.Socket dealerSocket;
+    
     /**
      * Lock for thread-safe access to the ZMQ socket.
-     * ZMQ sockets are NOT thread-safe.
-     * We use non-blocking mode with polling to allow both send() and recv()
-     * to proceed without long blocking calls that would starve the other operation.
+     * ZMQ sockets are NOT thread-safe, so ALL socket operations must be synchronized.
+     * 
+     * Lock hold times:
+     * - recv(): max 300ms (socket timeout)
+     * - send(): <1ms (immediate)
+     * 
+     * This pattern ensures:
+     * 1. Receiver gets exclusive access to socket during recv()
+     * 2. Sender waits at most 300ms for Receiver to release lock
+     * 3. Heartbeat window: 300-600ms (within 1000ms heartbeat interval)
      */
     private final Object socketLock = new Object();
 
@@ -39,11 +54,11 @@ public class ZeromqClient implements Client {
         this.dealerSocket = context.socket(ZMQ.DEALER);
         this.dealerSocket.setIdentity(this.identity.getBytes());
         
-        // Use non-blocking mode with short polls instead of long blocking recv()
-        // This allows both send() and recv() to proceed without starving each other
-        // ZMQ_RCVTIMEO = 0 means non-blocking (return immediately if no message)
-        this.dealerSocket.setReceiveTimeOut(0);  // Non-blocking
-        this.dealerSocket.setSendTimeOut(0);     // Non-blocking
+        // Set 300ms receive timeout to balance:
+        // 1. Responsiveness: Lock released 3-4 times per heartbeat interval (1000ms)
+        // 2. Safety: Prevents indefinite blocking if master stops responding
+        // 3. Fairness: Sender gets opportunity to acquire lock every 300ms
+        this.dealerSocket.setReceiveTimeOut(300);
         
         boolean connected = this.dealerSocket.connect(String.format("tcp://%s:%d", host, port));
         if (connected) {
@@ -57,15 +72,17 @@ public class ZeromqClient implements Client {
     public Message recv() throws IOException {
         synchronized (socketLock) {
             try {
-                // Non-blocking receive - returns null immediately if no message
-                byte[] bytes = this.dealerSocket.recv(ZMQ.DONTWAIT);
+                // Blocking receive with 300ms timeout
+                // This timeout ensures the lock is released periodically,
+                // allowing Sender thread to get its turn
+                byte[] bytes = this.dealerSocket.recv();
                 if (bytes == null) {
-                    // No message available right now - that's OK, try again later
+                    // Timeout occurred - this is normal, just means no message right now
                     return null;
                 }
                 return new Message(bytes);
             } catch (ZMQException ex) {
-                // EAGAIN means no message available (expected with non-blocking)
+                // EAGAIN means receive timeout (expected with 300ms timeout)
                 if (ex.getErrorCode() == zmq.ZError.EAGAIN) {
                     return null;
                 }
@@ -79,14 +96,10 @@ public class ZeromqClient implements Client {
         synchronized (socketLock) {
             try {
                 byte[] bytes = message.getBytes();
-                // Non-blocking send with DONTWAIT flag
-                this.dealerSocket.send(bytes, ZMQ.DONTWAIT);
+                // Blocking send - waits for buffer space if needed
+                // With proper timeout handling in recv(), this won't block indefinitely
+                this.dealerSocket.send(bytes);
             } catch (ZMQException ex) {
-                // EAGAIN means socket buffer is full (queue is full)
-                // This is expected under load - caller should retry
-                if (ex.getErrorCode() == zmq.ZError.EAGAIN) {
-                    throw new IOException("ZMQ socket send buffer full, retry later", ex);
-                }
                 throw new IOException("Failed to send ZeroMQ message", ex);
             }
         }
